@@ -2759,8 +2759,17 @@ func held(h http.Handler) http.Handler {
 	})
 }
 
+// stateSettings is settings.Load without the two credentials it keeps: the
+// state is the page's, and neither the GitHub token nor the LAN key belongs
+// in it. The page reads them masked from /api/settings (settingsState).
+func stateSettings() settings.Settings {
+	st := settings.Load()
+	st.GitHubToken, st.LANKey = "", ""
+	return st
+}
+
 func state() stateJSON {
-	s := stateJSON{Agents: []agentJSON{}, Profiles: []profileJSON{}, Catalog: catalog.Source(), Settings: settings.Load()}
+	s := stateJSON{Agents: []agentJSON{}, Profiles: []profileJSON{}, Catalog: catalog.Source(), Settings: stateSettings()}
 	// state() is asked for after nearly every click, so the rate — a
 	// network fetch once every TTL — is only worth its rare latency when
 	// cny is actually chosen; usd never looks at it

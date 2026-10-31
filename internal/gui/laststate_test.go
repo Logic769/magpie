@@ -21,7 +21,8 @@ func forgetLastState() {
 
 // #1519: the Agents page draws the state kept from the last read at once
 // (?last=1), this run's or the run before's, with the settings as they are
-// now; none kept is null, and the settings' secrets never reach the file.
+// now; none kept is null, and the settings' secrets reach neither the file
+// nor the page (#4480).
 func TestLastKnownState(t *testing.T) {
 	h := sandboxHome(t)
 	t.Setenv("CODEX_HOME", filepath.Join(h, ".codex"))
@@ -29,6 +30,7 @@ func TestLastKnownState(t *testing.T) {
 	os.WriteFile(filepath.Join(h, ".codex", "config.toml"), []byte("model = \"gpt-5.4\"\n"), 0o600)
 	s := settings.Load()
 	s.GitHubToken = "ghp_secret1519"
+	s.LANKey = "sk-lan-1519"
 	s.Theme = "light"
 	if err := settings.Save(s); err != nil {
 		t.Fatal(err)
@@ -62,12 +64,15 @@ func TestLastKnownState(t *testing.T) {
 	if fresh.Last || !hasCodex(fresh) {
 		t.Fatalf("fresh state: last=%v codex=%v", fresh.Last, hasCodex(fresh))
 	}
+	if fresh.Settings.GitHubToken != "" || fresh.Settings.LANKey != "" {
+		t.Errorf("state carried the credentials: token %q lanKey %q", fresh.Settings.GitHubToken, fresh.Settings.LANKey)
+	}
 	file, err := os.ReadFile(lastStatePath())
 	if err != nil {
 		t.Fatalf("the read was not kept: %v", err)
 	}
-	if strings.Contains(string(file), "ghp_secret1519") {
-		t.Error("the kept state holds the GitHub token")
+	if strings.Contains(string(file), "ghp_secret1519") || strings.Contains(string(file), "sk-lan-1519") {
+		t.Error("the kept state holds the credentials")
 	}
 
 	// the user changes a setting, and magpie starts again
@@ -82,8 +87,14 @@ func TestLastKnownState(t *testing.T) {
 	if !last.Last || !hasCodex(last) {
 		t.Fatalf("last-known state: last=%v codex=%v", last.Last, hasCodex(last))
 	}
-	if last.Settings.Theme != "dark" || last.Settings.GitHubToken != "ghp_secret1519" {
-		t.Errorf("last-known state's settings are not today's: theme %q token %q", last.Settings.Theme, last.Settings.GitHubToken)
+	if last.Settings.Theme != "dark" {
+		t.Errorf("last-known state's settings are not today's: theme %q", last.Settings.Theme)
+	}
+	if last.Settings.GitHubToken != "" || last.Settings.LANKey != "" {
+		t.Errorf("last-known state carried the credentials: token %q lanKey %q", last.Settings.GitHubToken, last.Settings.LANKey)
+	}
+	if b := get("/api/state?last=1"); strings.Contains(b, "ghp_secret1519") || strings.Contains(b, "sk-lan-1519") {
+		t.Error("the page was served the credentials")
 	}
 
 	// another version's is not drawn
