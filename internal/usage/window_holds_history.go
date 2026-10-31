@@ -14,8 +14,9 @@ import (
 // A shorter window is its last observed cycle, not all its cycles added.
 func HistoricalWindowHolds(cards []provider.SubscriptionQuota, hist []provider.QuotaHistory, from, to time.Time) []provider.SubscriptionQuota {
 	snapshots := []provider.SubscriptionQuota{}
-	for _, q := range cards {
-		if q.From != "" || q.User == "" {
+	lone := loneCards(cards)
+	for i, q := range cards {
+		if q.From != "" || q.User == "" && !lone[i] {
 			continue
 		}
 		for _, h := range hist {
@@ -86,11 +87,12 @@ func HistoricalWindowHolds(cards []provider.SubscriptionQuota, hist []provider.Q
 func withRecordedWindowStarts(cards []provider.SubscriptionQuota, hist []provider.QuotaHistory, now time.Time) []provider.SubscriptionQuota {
 	out := make([]provider.SubscriptionQuota, len(cards))
 	copy(out, cards)
+	lone := loneCards(cards)
 	for i, q := range cards {
 		at := readAtOf(q, now)
 		cloned := false
 		for j, w := range q.Windows {
-			start, end, why := holdsBounds(q, w, at)
+			start, end, why := holdsBounds(q, w, at, lone[i])
 			if why != "" {
 				continue
 			}

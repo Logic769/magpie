@@ -38,14 +38,39 @@ func WithWindowHolds(qs []provider.SubscriptionQuota, now time.Time) []provider.
 	return withSpansOf(out, qs)
 }
 
+// loneCards is, for each card, whether it is its provider's only one: a plan
+// with a single key is carded without a user name, and the calls made on that
+// key name no account, so the card takes them (#4507). A provider's cards are
+// told apart by the account each names, so a list that is one card per window
+// (HistoricalWindowHolds' snapshots) still names one account.
+func loneCards(qs []provider.SubscriptionQuota) []bool {
+	users := map[string]map[string]bool{} // provider → the accounts its cards name
+	for _, q := range qs {
+		if q.Error != "" || q.From != "" || q.Balance != "" {
+			continue // a card no window is ever reckoned on is no other card
+		}
+		u := strings.ToLower(q.User)
+		if users[q.Provider] == nil {
+			users[q.Provider] = map[string]bool{}
+		}
+		users[q.Provider][u] = true
+	}
+	out := make([]bool, len(qs))
+	for i, q := range qs {
+		out[i] = q.User == "" && len(users[q.Provider]) == 1
+	}
+	return out
+}
+
 // holdsSince is the earliest start of a window that could be reckoned.
 func holdsSince(qs []provider.SubscriptionQuota, now time.Time) (time.Time, bool) {
 	var since time.Time
 	found := false
-	for _, q := range qs {
+	lone := loneCards(qs)
+	for i, q := range qs {
 		at := readAtOf(q, now)
 		for _, w := range q.Windows {
-			if start, _, why := holdsBounds(q, w, at); why == "" && (!found || start.Before(since)) {
+			if start, _, why := holdsBounds(q, w, at, lone[i]); why == "" && (!found || start.Before(since)) {
 				since, found = start, true
 			}
 		}
@@ -66,8 +91,8 @@ func readAtOf(q provider.SubscriptionQuota, now time.Time) time.Time {
 // and is used enough, and a reading not past its reset. why is empty where
 // it can be, else the provider.Holds* reason it can't, or "-" for a window
 // whose whole is never told (no reason worth a line on the card).
-func holdsBounds(q provider.SubscriptionQuota, w provider.QuotaWindow, at time.Time) (start, end time.Time, why string) {
-	if q.Error != "" || q.From != "" || q.User == "" || q.Balance != "" {
+func holdsBounds(q provider.SubscriptionQuota, w provider.QuotaWindow, at time.Time, lone bool) (start, end time.Time, why string) {
+	if q.Error != "" || q.From != "" || q.User == "" && !lone || q.Balance != "" {
 		return time.Time{}, time.Time{}, "-"
 	}
 	// An Antigravity pool's window is told, by its models' calls (max2020 on
@@ -113,8 +138,9 @@ func dryRuns(qs []provider.SubscriptionQuota, hist []provider.QuotaHistory, now 
 			lines[h.Provider+"\x00"+strings.ToLower(h.User)+"\x00"+l.Name] = l.Points
 		}
 	}
-	for _, q := range qs {
-		if q.User == "" {
+	lone := loneCards(qs)
+	for i, q := range qs {
+		if q.User == "" && !lone[i] {
 			continue
 		}
 		at := readAtOf(q, now)
@@ -187,10 +213,12 @@ func windowHolds(qs []provider.SubscriptionQuota, now, first time.Time, priceOf 
 	want := map[slot]span{}
 	why := map[slot]string{} // a window not reckoned, and why
 	byAccount := map[string][]slot{}
+	byLone := map[string][]slot{} // a lone key's card, by provider
+	lone := loneCards(qs)
 	for i, q := range qs {
 		at := readAtOf(q, now)
 		for j, w := range q.Windows {
-			start, _, no := holdsBounds(q, w, at)
+			start, _, no := holdsBounds(q, w, at, lone[i])
 			switch {
 			case no == "-":
 				continue
@@ -201,8 +229,12 @@ func windowHolds(qs []provider.SubscriptionQuota, now, first time.Time, priceOf 
 				why[slot{i, j}] = provider.HoldsBeforeLog
 				continue
 			}
-			k := q.Provider + "\x00" + strings.ToLower(q.User)
-			byAccount[k] = append(byAccount[k], slot{i, j})
+			if lone[i] {
+				byLone[q.Provider] = append(byLone[q.Provider], slot{i, j})
+			} else {
+				k := q.Provider + "\x00" + strings.ToLower(q.User)
+				byAccount[k] = append(byAccount[k], slot{i, j})
+			}
 			want[slot{i, j}] = span{start, at}
 		}
 	}
@@ -226,26 +258,37 @@ func windowHolds(qs []provider.SubscriptionQuota, now, first time.Time, priceOf 
 		// the call answers as the account it went out as, or, when it went
 		// on a key (which names no account, #557), as the key: a plan's
 		// card is on the key, named as the ledger names it (#3747)
-		who := r.Account()
+		account := r.Account()
+		who := account
 		if who == "" {
 			who = r.ProviderKeyName
 		}
 		acct := r.Provider + "\x00" + strings.ToLower(who)
-		var runs []runKey
-		for i, d := range dry[acct] {
-			if !d.holds(r.Time) {
-				continue
-			}
-			k := runKey{acct, i}
-			runs = append(runs, k)
-			if d.lastLeft.IsZero() || r.Status < 400 && !r.Time.Before(d.firstDry) {
-				paidOtherwise[k] = true
+		// a lone card's kept readings are under the account it has not, and a
+		// call on its key names none either (#4507)
+		kept := []string{acct}
+		if account == "" {
+			if k := r.Provider + "\x00"; k != acct {
+				kept = append(kept, k)
 			}
 		}
-		for _, s := range byAccount[acct] {
+		var runs []runKey
+		for _, a := range kept {
+			for i, d := range dry[a] {
+				if !d.holds(r.Time) {
+					continue
+				}
+				k := runKey{a, i}
+				runs = append(runs, k)
+				if d.lastLeft.IsZero() || r.Status < 400 && !r.Time.Before(d.firstDry) {
+					paidOtherwise[k] = true
+				}
+			}
+		}
+		count := func(s slot) {
 			b := want[s]
 			if r.Time.Before(b.start) || r.Time.After(b.end) || !qs[s.q].Windows[s.w].CountsIn(qs[s.q].Windows, r.Model) {
-				continue
+				return
 			}
 			inRun[s] = append(inRun[s], runs...)
 			h := sums[s]
@@ -261,6 +304,17 @@ func windowHolds(qs []provider.SubscriptionQuota, now, first time.Time, priceOf 
 				h.Routed.Cost += r.CostAt(*pr)
 			} else {
 				unpriced[s] = true
+			}
+		}
+		for _, s := range byAccount[acct] {
+			count(s)
+		}
+		// a plan with one key is carded unnamed, and a call made on that key
+		// names no account: it is that card's, under whatever name the key
+		// carries (#4507)
+		if account == "" {
+			for _, s := range byLone[r.Provider] {
+				count(s)
 			}
 		}
 	})
